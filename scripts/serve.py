@@ -12,6 +12,16 @@ import uvicorn
 
 
 def main() -> None:
+    # Test-only fault-injection knobs (env vars are simply absent in
+    # production): a slow tmp write and a failing physical delete.
+    from app import storage
+
+    stall = os.environ.get("ARCHIVE_TEST_STAGE_STALL_SECONDS")
+    if stall:
+        storage.STAGE_STALL_SECONDS = float(stall)
+    if os.environ.get("ARCHIVE_TEST_SIMULATE_UNLINK_FAILURE") == "1":
+        storage.SIMULATE_UNLINK_FAILURE = True
+
     uvicorn.run(
         "app.api:app",
         host="127.0.0.1",

@@ -2,12 +2,25 @@
 # SQLite in WAL mode tolerates multi-process access; every mutating
 # endpoint takes a short BEGIN IMMEDIATE lock, and downloads hold no
 # database lock while streaming.
+#
+# ARCHIVE_CAPACITY_BYTES sets the admission budget for deduplicated
+# originals (bytes). Both replicas must declare the same value: the
+# limit is enforced transactionally against the shared ledger, but it
+# is startup configuration, not a stored row. Over-limit new-content
+# uploads get HTTP 507; downloads, retirements and reuse keep working.
+x-common-env: &common-env
+  ARCHIVE_DATA_DIR: /data
+  # 5 MiB budget for content-addressed originals (demonstration size).
+  ARCHIVE_CAPACITY_BYTES: "5242880"
+  ARCHIVE_HEARTBEAT_SECONDS: "2"
+  ARCHIVE_NODE_TTL_SECONDS: "30"
+
 services:
   archive-api-a:
     build: .
     image: archive-reclamation:latest
     environment:
-      ARCHIVE_DATA_DIR: /data
+      <<: *common-env
       INSTANCE_NAME: api-a
     ports:
       - "8001:8000"
@@ -25,7 +38,7 @@ services:
     image: archive-reclamation:latest
     build: .
     environment:
-      ARCHIVE_DATA_DIR: /data
+      <<: *common-env
       INSTANCE_NAME: api-b
     ports:
       - "8002:8000"

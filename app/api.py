@@ -20,7 +20,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from . import config, db, storage
+from . import capacity, config, db, storage
 
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +52,20 @@ class StorageSummary(BaseModel):
     quarantined_files: int
     queued_for_gc: int
     bytes_used_by_blobs: int
+    # Capacity admission counters.  capacity_limit_bytes is null when no
+    # ARCHIVE_CAPACITY_BYTES was configured; available_bytes is null then.
+    capacity_limit_bytes: int | None
+    occupied_bytes: int
+    reserved_bytes: int
+    available_bytes: int | None
 
 
 class GcResponse(BaseModel):
     marked: list[str]
     deleted_blobs: list[str]
+    # Originals whose physical delete failed: they remain charged against
+    # the capacity budget until a later GC sweep removes the bytes.
+    delete_failed_blobs: list[str]
     restored_blobs: list[str]
     reaped_unknown_files: list[str]
     swept_queued: int
@@ -76,18 +85,29 @@ class UploadResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     db.init_db()
-    # Resume any GC work interrupted by a previous process exit.
+    # Resume any GC work interrupted by a previous process exit and
+    # release orphaned capacity reservations left by dead uploads.
     storage.reconcile()
-    yield
+    # Announce liveness before serving so this instance's own in-flight
+    # uploads are protected from another instance's reaper.
+    heartbeats = capacity.HeartbeatThread()
+    heartbeats.start()
+    try:
+        yield
+    finally:
+        heartbeats.stop()
 
 
 app = FastAPI(
     title="Sequencing Center Archive Reclamation API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Upload per-batch ZIP archives (deduplicated by SHA-256), "
-        "download original bytes, retire batches and garbage-collect "
-        "originals that no batch references anymore."
+        "Upload per-batch ZIP archives (deduplicated by SHA-256) under a "
+        "configurable byte-capacity budget, download original bytes, "
+        "retire batches and garbage-collect originals that no batch "
+        "references anymore. Over-limit requests are rejected with 507; "
+        "downloads, retirements and reuse of existing content stay "
+        "available even when the budget is full."
     ),
     lifespan=lifespan,
 )
@@ -127,7 +147,22 @@ def _validate_batch_id(batch_id: str) -> None:
 # Endpoints
 # --------------------------------------------------------------------------- #
 
-@app.post("/batches/{batch_id}/archive", response_model=UploadResponse)
+@app.post(
+    "/batches/{batch_id}/archive",
+    response_model=UploadResponse,
+    responses={
+        507: {
+            "description": "Insufficient Storage: admitting the new "
+                           "content would exceed ARCHIVE_CAPACITY_BYTES. "
+                           "No batch number is consumed. Downloads, "
+                           "retirements and reuse of existing content "
+                           "remain available in this state.",
+        },
+        409: {"description": "Retired batch number, or conflicting content."},
+        413: {"description": "Upload exceeds the 2 MiB per-file limit."},
+        400: {"description": "Empty or non-ZIP upload body."},
+    },
+)
 def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadResponse:
     """Store a batch's ZIP archive (max 2 MiB).
 
@@ -135,6 +170,10 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
     * Same batch + different SHA-256 is rejected with 409.
     * Retired batch numbers can never be reused (409).
     * Identical SHA-256 content is stored exactly once on disk.
+    * New content is admitted only when the configured byte budget has
+      room; otherwise 507 is returned and no batch row is created, so
+      the batch number is not consumed.  Re-uploading existing content
+      never needs extra budget, even when the limit is already reached.
     """
     _validate_batch_id(batch_id)
     try:
@@ -144,7 +183,8 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
                             detail=str(exc)) from exc
 
     # Stage bytes before taking the write lock so the critical section
-    # only contains database work and a fast rename.
+    # only contains database work and a fast rename.  Staged parts do
+    # not count against the capacity budget.
     tmp = storage.stage_tmp(body)
 
     try:
@@ -175,6 +215,28 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
             blob = conn.execute(
                 "SELECT * FROM blobs WHERE sha256 = ?", (sha256,)
             ).fetchone()
+
+            # Capacity admission.  Content already paid for by an
+            # existing blob row or another in-flight reservation needs
+            # no additional budget (deduplicated, single charge).
+            try:
+                capacity.reserve(conn, sha256, len(body), tmp.name)
+            except capacity.CapacityExceeded as exc:
+                # Nothing was inserted in this transaction yet beyond the
+                # reservation attempt, which is rolled back; no batch
+                # number is consumed.
+                raise HTTPException(
+                    status_code=507,
+                    detail={
+                        "error": "archive capacity limit exceeded",
+                        "message": str(exc),
+                        "capacity_limit_bytes": exc.limit,
+                        "occupied_and_reserved_bytes": exc.committed,
+                        "requested_bytes": exc.requested,
+                        "available_bytes": exc.available,
+                    },
+                ) from exc
+
             if blob is None:
                 conn.execute(
                     "INSERT INTO blobs (sha256, size_bytes, status) "
@@ -206,8 +268,18 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
         storage.publish(tmp, sha256)
         if storage.quarantine_path(sha256).exists():
             storage.move_back_from_quarantine(sha256)
+        # The blob row now owns the charge; the in-flight reservation is
+        # redundant (best-effort cleanup, also reconciled on restart).
+        capacity.release_reservation(sha256)
     except BaseException:
         tmp.unlink(missing_ok=True)
+        # Roll back a reservation when the upload failed after admission
+        # (e.g. a later error in the same transaction already rolled it
+        # back, in which case this is a harmless no-op).
+        try:
+            capacity.release_reservation(sha256)
+        except Exception:  # pragma: no cover - cleanup must not mask error
+            pass
         raise
 
     return UploadResponse(
@@ -341,7 +413,7 @@ def get_batch(batch_id: str) -> BatchSummary:
 
 @app.get("/storage/summary", response_model=StorageSummary)
 def storage_summary() -> StorageSummary:
-    """Inventory view for reconciling reclamation results."""
+    """Inventory view for reconciling reclamation results and capacity."""
     conn = db.get_conn()
     active = conn.execute(
         "SELECT COUNT(*) FROM batches WHERE status = 'active'"
@@ -354,6 +426,7 @@ def storage_summary() -> StorageSummary:
 
     blob_files = [p for p in config.BLOB_DIR.iterdir() if p.is_file()]
     quarantined = [p for p in config.QUARANTINE_DIR.iterdir() if p.is_file()]
+    usage = capacity.capacity_usage(conn)
     return StorageSummary(
         active_batches=active,
         retired_batches=retired,
@@ -362,6 +435,10 @@ def storage_summary() -> StorageSummary:
         quarantined_files=len(quarantined),
         queued_for_gc=queued,
         bytes_used_by_blobs=sum(p.stat().st_size for p in blob_files),
+        capacity_limit_bytes=usage["capacity_limit_bytes"],
+        occupied_bytes=usage["occupied_bytes"],
+        reserved_bytes=usage["reserved_bytes"],
+        available_bytes=usage["available_bytes"],
     )
 
 

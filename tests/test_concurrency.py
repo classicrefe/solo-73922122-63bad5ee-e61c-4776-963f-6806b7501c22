@@ -2,105 +2,18 @@
 
 Two uvicorn subprocesses are spawned (independent interpreters and
 SQLite connections) against the same data directory - the same topology
-as the two Docker Compose replicas sharing one named volume.
+as the two Docker Compose replicas sharing one named volume.  The
+``two_instances`` and ``limited_cluster`` fixtures live in conftest.py.
 """
 from __future__ import annotations
 
 import hashlib
-import os
-import socket
-import subprocess
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import httpx
-import pytest
 
 from conftest import make_zip
-
-ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / "scripts" / "serve.py"
-
-# fastapi/uvicorn live in the user site in this environment; make them
-# importable in the spawned interpreters without dropping isolation of
-# the data directory.
-import site  # noqa: E402
-_USER_SITE = site.getusersitepackages()
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _wait_healthy(url: str, proc: subprocess.Popen) -> None:
-    for _ in range(100):
-        if proc.poll() is not None:
-            raise RuntimeError(f"server exited early: {proc.stderr.read()!r}")
-        try:
-            r = httpx.get(f"{url}/healthz", timeout=1)
-            if r.status_code == 200:
-                return
-        except httpx.TransportError:
-            time.sleep(0.1)
-    raise RuntimeError(f"server at {url} never became healthy")
-
-
-@pytest.fixture
-def two_instances(data_dir):
-    ports = [_free_port(), _free_port()]
-    env_base = dict(os.environ, ARCHIVE_DATA_DIR=str(data_dir))
-    procs = []
-    for port in ports:
-        env = dict(
-            env_base,
-            ARCHIVE_TEST_PORT=str(port),
-            ENABLE_SHUTDOWN_ENDPOINT="1",
-            PYTHONPATH=os.pathsep.join([str(ROOT), _USER_SITE]),
-        )
-        procs.append(subprocess.Popen(
-            [sys.executable, str(SERVER)],
-            cwd=str(ROOT),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        ))
-    urls = [f"http://127.0.0.1:{p}" for p in ports]
-    try:
-        for url, proc in zip(urls, procs):
-            _wait_healthy(url, proc)
-        yield urls
-    finally:
-        # Cooperative HTTP shutdown: this runtime blocks os.kill, and it
-        # also exercises uvicorn's graceful drain of open downloads.
-        for url in urls:
-            try:
-                httpx.post(f"{url}/internal/shutdown", timeout=5)
-            except httpx.HTTPError:
-                pass
-        for proc in procs:
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except PermissionError:
-                    pass
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-        # Surface server-side errors (truncated) for test diagnostics.
-        for proc in procs:
-            err = proc.stderr.read() if proc.stderr else ""
-            if "Traceback" in err:
-                raise AssertionError(
-                    "server traceback:\n" + err[-4000:]
-                )
 
 
 def _upload(url: str, batch_id: str, body: bytes) -> int:

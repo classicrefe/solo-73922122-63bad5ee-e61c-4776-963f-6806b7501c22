@@ -46,6 +46,31 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     sha256     TEXT PRIMARY KEY,
     enqueued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- One row per in-flight upload that has reserved capacity.  Capacity is
+-- reserved per content hash, so two uploads of identical SHA-256 share a
+-- single reservation and are charged only once.  Rows whose owning node
+-- has stopped heartbeating (or whose staged part vanished) are treated as
+-- orphaned and released on restart reconciliation.
+CREATE TABLE IF NOT EXISTS capacity_reservations (
+    sha256      TEXT PRIMARY KEY,
+    size_bytes  INTEGER NOT NULL,
+    node_id     TEXT NOT NULL,
+    tmp_name    TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Liveness of each API process sharing the volume.  A node refreshes its
+-- heartbeat row on a timer; rows older than the configured TTL belong to
+-- dead processes, so their reservations may safely be released.
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id        TEXT PRIMARY KEY,
+    last_heartbeat TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    started_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_node
+    ON capacity_reservations(node_id);
 """
 
 _local = threading.local()

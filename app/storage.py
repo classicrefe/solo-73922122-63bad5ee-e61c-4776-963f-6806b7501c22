@@ -33,18 +33,30 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import os
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
-from . import config, db
+from . import capacity, config, db
 
-# Test hook: when set, the GC process exits (os._exit) at this checkpoint.
-# Used by the crash-recovery tests; never set in production.
+logger = logging.getLogger("storage")
+
+# Test hooks (never enabled in production):
+# * CRASH_HOOK - GC hard-exits (os._exit) at the named checkpoint.
+# * SIMULATE_UNLINK_FAILURE - physical deletions fail so the blob row
+#   stays in 'deleting' and keeps occupying the capacity budget; a later
+#   GC run retries and finally frees the quota.
+# * STAGE_STALL_SECONDS - sleep after writing a tmp part, emulating a
+#   slow single-file write so tests can prove unrelated work is not
+#   blocked.
 CRASH_HOOK: str | None = None
+SIMULATE_UNLINK_FAILURE = False
+STAGE_STALL_SECONDS = 0.0
 
 
 class UploadError(ValueError):
@@ -58,6 +70,18 @@ def _fsync_dir(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _unlink(path: Path) -> None:
+    """Unlink with an injectable failure mode for quota tests.
+
+    On failure the caller must leave its blob row in place, so the
+    content keeps occupying the capacity budget until a later sweep
+    actually removes the bytes.
+    """
+    if SIMULATE_UNLINK_FAILURE:
+        raise OSError(f"simulated unlink failure for {path}")
+    path.unlink(missing_ok=True)
 
 
 def blob_path(sha256: str) -> Path:
@@ -106,6 +130,11 @@ def stage_tmp(body: bytes) -> Path:
         fh.write(body)
         fh.flush()
         os.fsync(fh.fileno())
+    if STAGE_STALL_SECONDS:
+        # Test-only pause emulating a slow disk write.  The reservation
+        # is not taken until the DB transaction, so this stall must not
+        # block any unrelated request.
+        time.sleep(STAGE_STALL_SECONDS)
     return tmp
 
 
@@ -129,6 +158,9 @@ class GcReport:
     reaped_unknown_files: list[str] = field(default_factory=list)
     marked: list[str] = field(default_factory=list)
     deleted_blobs: list[str] = field(default_factory=list)
+    # Blobs whose physical delete failed: rows stay in 'deleting' and the
+    # capacity budget stays charged until a later sweep succeeds.
+    delete_failed_blobs: list[str] = field(default_factory=list)
     restored_blobs: list[str] = field(default_factory=list)
     swept_queued: int = 0
 
@@ -140,7 +172,12 @@ def move_back_from_quarantine(sha256: str) -> None:
     if qpath.exists():
         if bpath.exists():
             # An upload already put fresh identical bytes back.
-            qpath.unlink(missing_ok=True)
+            try:
+                _unlink(qpath)
+            except OSError:
+                logger.warning(
+                    "could not remove duplicate quarantine file %s", qpath
+                )
         else:
             os.replace(qpath, bpath)
             _fsync_dir(config.BLOB_DIR)
@@ -155,7 +192,13 @@ def _mark(report: GcReport) -> None:
     known = {row["sha256"] for row in conn.execute("SELECT sha256 FROM blobs")}
     on_disk = {p.name for p in config.BLOB_DIR.iterdir() if p.is_file()}
     for name in sorted(on_disk - known):
-        (config.BLOB_DIR / name).unlink(missing_ok=True)
+        try:
+            _unlink(config.BLOB_DIR / name)
+        except OSError:
+            # Leave the file for a later sweep; one stubborn file must
+            # not block reclamation of the rest.
+            logger.warning("could not reap unknown file %s", name)
+            continue
         report.reaped_unknown_files.append(name)
 
     # Queue every ready blob without an active batch reference.
@@ -180,13 +223,16 @@ def _mark(report: GcReport) -> None:
 
 
 def _finish_phase_two(sha256: str, report: GcReport) -> None:
-    """Delete the blob row under the write lock, then remove its bytes.
+    """Actually remove the bytes, then delete the blob row.
 
-    References are re-checked inside the transaction: a concurrently
+    References are re-checked inside a transaction: a concurrently
     committed upload reusing this hash forces a restore instead of
-    deletion.  If an upload re-created a *new* ``ready`` row while the
-    old one sat in ``deleting``, the bytes are kept in quarantine for
-    that upload to republish rather than unlinked.
+    deletion.  The blob row is deleted *after* the physical unlink
+    succeeds, so a failed delete leaves the row in ``deleting`` and the
+    content keeps occupying the capacity budget; a later sweep retries.
+    If an upload re-created a *new* ``ready`` row while the old one sat
+    in ``deleting``, the bytes are kept in quarantine for that upload to
+    republish rather than unlinked.
     """
     conn = db.get_conn()
     with db.transaction():
@@ -203,31 +249,13 @@ def _finish_phase_two(sha256: str, report: GcReport) -> None:
             )
             conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
             restored = True
+            live_ready = False
         else:
             live_ready = conn.execute(
                 "SELECT 1 FROM blobs WHERE sha256 = ? AND status = 'ready' "
                 "LIMIT 1",
                 (sha256,),
             ).fetchone()
-            conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha256,))
-            conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
-            if live_ready:
-                # An upload racing us already committed a replacement row.
-                # Re-insert it so the table still names the bytes; the
-                # upload's publish/move_back step will materialize them.
-                size_row = conn.execute(
-                    "SELECT size_bytes FROM batches WHERE sha256 = ? "
-                    "LIMIT 1",
-                    (sha256,),
-                ).fetchone()
-                size_bytes = size_row["size_bytes"] if size_row else (
-                    q.stat().st_size if q.exists() else 0
-                )
-                conn.execute(
-                    "INSERT INTO blobs (sha256, size_bytes, status) "
-                    "VALUES (?, ?, 'ready')",
-                    (sha256, size_bytes),
-                )
             restored = False
 
     if restored:
@@ -236,26 +264,79 @@ def _finish_phase_two(sha256: str, report: GcReport) -> None:
         return
 
     qpath = quarantine_path(sha256)
+    bpath = blob_path(sha256)
+
     if live_ready:
-        # Keep the quarantined bytes: the racing upload moves them back
-        # (or republishes identical bytes from its own staged part).
-        if blob_path(sha256).exists():
-            qpath.unlink(missing_ok=True)
-        # The old 'deleting' row was replaced by a live 'ready' row.
+        # An upload racing us already committed a replacement row.
+        # Keep the quarantined bytes: the upload moves them back (or
+        # republishes identical bytes from its own staged part).
+        if bpath.exists():
+            try:
+                _unlink(qpath)
+            except OSError:
+                # Harmless duplicate cleanup failure; the live ready row
+                # is what matters now.
+                pass
         report.restored_blobs.append(sha256)
         return
-    qpath.unlink(missing_ok=True)
 
-    # A same-hash upload committing after our row delete recreates the row
-    # before publishing the file.  Only remove an orphan without a live row.
-    bpath = blob_path(sha256)
-    if bpath.exists():
-        live = conn.execute(
-            "SELECT 1 FROM blobs WHERE sha256 = ?", (sha256,)
-        ).fetchone()
-        if live is None:
-            bpath.unlink(missing_ok=True)
+    # No references and no replacement row: delete the actual bytes.
+    # Both locations are covered because a crash may leave a copy in
+    # either blobs/ or quarantine/.
+    try:
+        _unlink(qpath)
+        _unlink(bpath)
+    except OSError:
+        # Delete failed: keep the 'deleting' row so the quota stays
+        # charged; leave the blob queued for a later sweep to retry.
+        logger.warning(
+            "physical delete failed for %s; quota stays reserved", sha256
+        )
+        report.delete_failed_blobs.append(sha256)
+        return
+
     _fsync_dir(config.QUARANTINE_DIR)
+    _fsync_dir(config.BLOB_DIR)
+
+    # Bytes confirmed gone: now release the ledger row (and the budget).
+    with db.transaction():
+        # Re-check under the lock: a same-hash upload may have committed
+        # while we were unlinking.
+        live = conn.execute(
+            "SELECT 1 FROM batches WHERE sha256 = ? AND status = 'active' "
+            "LIMIT 1",
+            (sha256,),
+        ).fetchone()
+        if live:
+            size_row = conn.execute(
+                "SELECT size_bytes FROM blobs WHERE sha256 = ? LIMIT 1",
+                (sha256,),
+            ).fetchone()
+            size_bytes = size_row["size_bytes"] if size_row else 0
+            conn.execute(
+                "UPDATE blobs SET status = 'ready', quarantine_path = NULL "
+                "WHERE sha256 = ?",
+                (sha256,),
+            )
+            if size_row is None:
+                conn.execute(
+                    "INSERT INTO blobs (sha256, size_bytes, status) "
+                    "VALUES (?, ?, 'ready')",
+                    (sha256, size_bytes),
+                )
+            conn.execute(
+                "DELETE FROM gc_queue WHERE sha256 = ?", (sha256,)
+            )
+            need_restore = True
+        else:
+            conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha256,))
+            conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
+            need_restore = False
+
+    if need_restore:
+        move_back_from_quarantine(sha256)
+        report.restored_blobs.append(sha256)
+        return
     report.deleted_blobs.append(sha256)
 
 
@@ -277,8 +358,12 @@ def _sweep_one(sha256: str, report: GcReport) -> None:
         # Resume after a crash between the move and the row deletion.
         if CRASH_HOOK == "phase2":
             os._exit(2)
+        before_failed = len(report.delete_failed_blobs)
         _finish_phase_two(sha256, report)
-        report.swept_queued += 1
+        # On a physical delete failure the gc_queue row survives so the
+        # next sweep retries; do not count it as fully swept.
+        if len(report.delete_failed_blobs) == before_failed:
+            report.swept_queued += 1
         return
 
     # status == 'ready': re-check references before touching the bytes.
@@ -331,8 +416,10 @@ def _sweep_one(sha256: str, report: GcReport) -> None:
 
     if CRASH_HOOK == "phase2":
         os._exit(2)
+    before_failed = len(report.delete_failed_blobs)
     _finish_phase_two(sha256, report)
-    report.swept_queued += 1
+    if len(report.delete_failed_blobs) == before_failed:
+        report.swept_queued += 1
 
 
 def run_gc() -> GcReport:
@@ -369,10 +456,40 @@ def reconcile() -> GcReport:
     """Resume interrupted GC work after a process exit/restart."""
     config.ensure_layout()
 
+    # 0. This is a fresh process: any reservations left under its own
+    #    node id belong to a previous incarnation and are orphans.
+    capacity.release_for_node(config.INSTANCE_ID)
+
+    conn = db.get_conn()
+    ttl_modifier = f"-{config.NODE_TTL_SECONDS} seconds"
+    live_nodes = {
+        r["node_id"]
+        for r in conn.execute(
+            "SELECT node_id FROM nodes "
+            "WHERE last_heartbeat >= "
+            "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+            (ttl_modifier,),
+        )
+    }
+    # Reservations still owned by live uploads: their tmp parts must not
+    # be touched by this instance's reconciliation.
+    protected_parts = {
+        r["tmp_name"]
+        for r in conn.execute(
+            "SELECT tmp_name FROM capacity_reservations WHERE node_id IN "
+            "(SELECT node_id FROM nodes "
+            " WHERE last_heartbeat >= "
+            " strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?))",
+            (ttl_modifier,),
+        )
+    }
+
     # 1. In-flight upload parts never became rows; drop them - unless a
     #    referenced blob is missing its bytes (crash between COMMIT and
     #    publish), in which case the part is the only surviving copy and
     #    must be moved into place so an active batch never lacks its file.
+    #    Parts belonging to another instance's live in-flight upload are
+    #    never touched.
     tmp_parts = list(config.TMP_DIR.glob("part-*"))
     if tmp_parts:
         missing = {
@@ -386,6 +503,8 @@ def reconcile() -> GcReport:
         }
         missing = {h for h in missing if not blob_path(h).exists()}
         for part in tmp_parts:
+            if part.name in protected_parts:
+                continue
             rescued = False
             if missing:
                 digest = hashlib.sha256(part.read_bytes()).hexdigest()
@@ -395,7 +514,15 @@ def reconcile() -> GcReport:
                     missing.discard(digest)
                     rescued = True
             if not rescued:
-                part.unlink(missing_ok=True)
+                try:
+                    part.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("could not remove orphan tmp part %s", part)
+
+    # 1b. Release reservations whose upload crashed, whose node died, or
+    #     whose content already committed.  Live uploads on other
+    #     instances keep their budget.
+    capacity.reap_orphan_reservations()
 
     conn = db.get_conn()
 
@@ -428,7 +555,12 @@ def reconcile() -> GcReport:
     }
     for qfile in config.QUARANTINE_DIR.iterdir():
         if qfile.is_file() and qfile.name not in tracked_q:
-            qfile.unlink(missing_ok=True)
+            try:
+                _unlink(qfile)
+            except OSError:
+                logger.warning(
+                    "could not remove orphan quarantine file %s", qfile
+                )
 
     # 4. Continue the normal mark/sweep pipeline.
     return run_gc()
